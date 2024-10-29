@@ -9,11 +9,33 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
+
+/*
+How the workqueue works:
+- Makes use of watcher in the Informer to watch for add/update/delete events
+- Client sends one of these events by creating/updating/deleting a deployment
+- The key for this deployment gets added to queue in the Informer cache
+
+- Program starts and controller starts a running worker as the Informer watches for events to add to queue
+- In processItem(), the worker is always trying to Get() items from the queue (every 1 second with wait.Until)
+- When a key gets added, it'll call doWork() to do work, which prints
+- doWork() returns an err or nil
+- if nil, then handleError() will Forget() (delete) the key from the queue
+- if err, then handleError() will requeue 5 times (rate limited), and if all fail, then we will also Forget() (delete)
+
+- Program ends with ctrl+c or by selecting 3 from displayMenu() which unblocks exitCh and ends main()
+- which then also closes stopCh, and everything else ends as well
+
+Refs:
+- https://web.archive.org/web/20240317164624/https://docs.bitnami.com/tutorials/a-deep-dive-into-kubernetes-controllers
+- https://github.com/kubernetes/client-go/blob/master/examples/workqueue/main.go
+*/
 
 type CustomController struct {
 	controller cache.Controller
@@ -30,12 +52,99 @@ func NewCustomController(controller cache.Controller, store cache.Store, queue w
 }
 
 func (c *CustomController) Run(stopCh <-chan struct{}) {
+	numWorkers := 1
+
+	// From workqueue/queue.go:
+	// ShutDown will cause q to ignore all new items added to it and
+	// immediately instruct the worker goroutines to exit
+	defer c.queue.ShutDown()
+
+	fmt.Println("\nStarting Deployment controller")
 	go c.controller.Run(stopCh)
 
 	if !cache.WaitForCacheSync(stopCh, c.controller.HasSynced) {
 		fmt.Println("Timed out waiting for caches to sync")
 		return
 	}
+
+	for i := 0; i < numWorkers; i++ {
+		go wait.Until(c.runWorker, time.Second, stopCh)
+		fmt.Println("\nEnding shift")
+	}
+
+	// Need this blocker to give time for the workers to work
+	<-stopCh
+}
+
+func (c *CustomController) runWorker() {
+	// loops while processItem returns true
+	for c.processItem() {
+	}
+}
+
+func (c *CustomController) processItem() bool {
+	// From workqueue/queue.go:
+	// If shutdown = true, the caller should end their goroutine.
+	// You must call Done with item when you have finished processing it.
+	key, shutdown := c.queue.Get()
+	if shutdown {
+		// ends loop in runWorker()
+		return false
+	}
+
+	// From workqueue/queue.go:
+	// Done marks item as done processing
+	// Since deferring, this happens when doWork() finishes
+	defer c.queue.Done(key)
+
+	err := c.doWork(key)
+	c.handleErr(err, key)
+
+	return true
+}
+
+// This is the method with all the business logic
+// Here it just prints
+// syncToStdout() from https://github.com/kubernetes/client-go/blob/master/examples/workqueue/main.go
+func (c *CustomController) doWork(key string) error {
+	obj, exists, err := c.store.GetByKey(key)
+	if err != nil {
+		fmt.Printf("\nError retrieving deployment for %s: %v\n", key, err)
+		return err
+	}
+	if !exists {
+		fmt.Printf("\nDeployment \"%s\" not found\n", key)
+	} else {
+		fmt.Printf("\nSync/Add/Update for Deployment: %s\n", obj.(*appsv1.Deployment).GetName())
+	}
+	return nil
+}
+
+func (c *CustomController) handleErr(err error, key string) {
+	maxRetries := 5
+
+	if err == nil {
+		// If successful, want to Forget() to remove from queue and stop retrying
+		// Forget() happens before calling Done() since Done() is called via defer
+		// From workqueue/rate_limiting_queue.go:
+		// Forget indicates that an item is finished being retried.
+		// This only clears the `rateLimiter`, you still have to call `Done` on the queue.
+		fmt.Printf("Successfully processed: %s\n", key)
+		c.queue.Forget(key)
+		return
+	}
+
+	if c.queue.NumRequeues(key) < maxRetries {
+		fmt.Printf("\nError syncing deployment \"%v\": %v\n", key, err)
+
+		c.queue.AddRateLimited(key)
+		return
+	}
+
+	c.queue.Forget(key)
+
+	fmt.Println("Failed to process deployment.")
+	fmt.Printf("Dropping deployment \"%q\" out of the queue: %v\n", key, err)
 }
 
 func main() {
@@ -75,23 +184,28 @@ func main() {
 		ListerWatcher: deploymentListWatcher,
 		ObjectType:    &appsv1.Deployment{},
 		Handler: cache.ResourceEventHandlerFuncs{
+			// Add items (keys) to queue when
 			AddFunc: func(obj interface{}) {
-				if deployment, ok := obj.(*appsv1.Deployment); ok {
-					fmt.Printf("\nNew Deployment Added: %s\n", deployment.Name)
+				key, err := cache.MetaNamespaceKeyFunc(obj) // just returns key as "namespace/name"
+				if err == nil {
+					queue.Add(key)
+					fmt.Println("\nAddFunc: Added to queue")
 				}
 			},
 			UpdateFunc: func(old, new interface{}) {
-				oldDeployment, ok := old.(*appsv1.Deployment)
-				if !ok {
-					return
-				}
-				if newDeployment, ok := new.(*appsv1.Deployment); ok {
-					fmt.Printf("\nDeployment Updated: %s -> %s\n", oldDeployment.Name, newDeployment.Name)
+				key, err := cache.MetaNamespaceKeyFunc(new)
+				if err == nil {
+					queue.Add(key)
+					fmt.Println("\nUpdateFunc: Added to queue")
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
-				if deployment, ok := obj.(*appsv1.Deployment); ok {
-					fmt.Printf("\nDeployment Deleted: %s\n", deployment.Name)
+				// first checks if object is DeletedFinalStateUnknown
+				// otherwise, just returns MetaNamespaceKeyFunc as well; key as "namespace/name"
+				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+				if err == nil {
+					queue.Add(key)
+					fmt.Println("\nDeleteFunc: Added to queue")
 				}
 			},
 		},
