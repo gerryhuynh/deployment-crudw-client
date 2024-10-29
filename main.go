@@ -11,15 +11,39 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
-var (
-	namespace   string
-	kubecontext string
-)
+type CustomController struct {
+	controller cache.Controller
+	store      cache.Store
+	queue      workqueue.TypedRateLimitingInterface[string]
+}
+
+func NewCustomController(controller cache.Controller, store cache.Store, queue workqueue.TypedRateLimitingInterface[string]) *CustomController {
+	return &CustomController{
+		controller: controller,
+		store:      store,
+		queue:      queue,
+	}
+}
+
+func (c *CustomController) Run(stopCh <-chan struct{}) {
+	go c.controller.Run(stopCh)
+
+	if !cache.WaitForCacheSync(stopCh, c.controller.HasSynced) {
+		fmt.Println("Timed out waiting for caches to sync")
+		return
+	}
+}
 
 func main() {
+	var (
+		namespace   string
+		kubecontext string
+	)
+
 	pflag.StringVarP(&kubecontext, "context", "c", "apps-sandbox1-us-ce1-lg8", "the kubernetes context the deployment will be on")
 	pflag.StringVarP(&namespace, "namespace", "n", apiv1.NamespaceDefault, "the namespace the deployment will be on")
 	pflag.Parse()
@@ -44,17 +68,39 @@ func main() {
 		fields.Everything(),
 	)
 
+	// [string] because processing resource (Deployment) keys, which are just strings -- i.e. "namespace/name"
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+
 	informerOptions := cache.InformerOptions{
 		ListerWatcher: deploymentListWatcher,
 		ObjectType:    &appsv1.Deployment{},
 		Handler: cache.ResourceEventHandlerFuncs{
-			AddFunc:    addFunc,
-			UpdateFunc: updateFunc,
-			DeleteFunc: deleteFunc,
+			AddFunc: func(obj interface{}) {
+				if deployment, ok := obj.(*appsv1.Deployment); ok {
+					fmt.Printf("\nNew Deployment Added: %s\n", deployment.Name)
+				}
+			},
+			UpdateFunc: func(old, new interface{}) {
+				oldDeployment, ok := old.(*appsv1.Deployment)
+				if !ok {
+					return
+				}
+				if newDeployment, ok := new.(*appsv1.Deployment); ok {
+					fmt.Printf("\nDeployment Updated: %s -> %s\n", oldDeployment.Name, newDeployment.Name)
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				if deployment, ok := obj.(*appsv1.Deployment); ok {
+					fmt.Printf("\nDeployment Deleted: %s\n", deployment.Name)
+				}
+			},
 		},
+		Indexers: cache.Indexers{},
 	}
 
 	store, controller := cache.NewInformerWithOptions(informerOptions)
+
+	customController := NewCustomController(controller, store, queue)
 
 	store.Add(&appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -63,72 +109,17 @@ func main() {
 		},
 	})
 
-	// Create a channel with empty struct (0 bytes of memory)
-	// Only care about signalling, not sending data
 	stopCh := make(chan struct{}) // for controller
 	exitCh := make(chan struct{}) // for displayMenu
-
-	// Defer, so closes channel when main() ends/exits
 	defer close(stopCh)
-	// exitCh is already being used to send a signal in displayMenu
-	// so don't need to do defer close(exitCh)
-	// if do both, would end up trying to close an already closed channel:
-	// - displayMenu sends a signal to exitCh which will close the channel
-	// - defer close(exitCh) would then run and try to close an alr closed channel
 
-	// Understanding from chatting with Claude (AI):
-	// But main() won't end until this ends
-	// This only ends when something externally triggers program termination
-	// E.g. SIGTERM signal or Ctrl+C (which sends SIGINT signal)
-	// Then the controller goes through graceful shutdown
-	// See this in the `select` blocks when clicking through
-	go controller.Run(stopCh)
-
-	// https://web.archive.org/web/20240317164624/https://docs.bitnami.com/tutorials/a-deep-dive-into-kubernetes-controllers
-	if !cache.WaitForCacheSync(stopCh, controller.HasSynced) {
-		fmt.Println("Timed out waiting for caches to sync")
-		return
-	}
+	go customController.Run(stopCh)
 
 	go displayMenu(store, exitCh)
 
-	// blocking until exit signal is received from display menu
-	// unblocks, prints, main() returns, and close(stopCh) executes as well; program ends
-	// https://gobyexample.com/channel-synchronization
+	// blocks until receive signal to exit from displayMenu
 	<-exitCh
 	fmt.Println("Exiting...")
-}
-
-func addFunc(obj interface{}) {
-	if deployment, ok := obj.(*appsv1.Deployment); ok {
-		fmt.Printf("\nNew Deployment Added: %s\n", deployment.Name)
-	}
-}
-
-func updateFunc(old, new interface{}) {
-	oldDeployment, ok := old.(*appsv1.Deployment)
-	if !ok {
-		return
-	}
-
-	newDeployment, ok := new.(*appsv1.Deployment)
-	if !ok {
-		return
-	}
-
-	fmt.Printf("\nDeployment Updated: %s -> %s\n", oldDeployment.Name, newDeployment.Name)
-
-	fmt.Println("\n\t[OLD]")
-	printDeployment(oldDeployment)
-
-	fmt.Println("\n\t[NEW]")
-	printDeployment(newDeployment)
-}
-
-func deleteFunc(obj interface{}) {
-	if deployment, ok := obj.(*appsv1.Deployment); ok {
-		fmt.Printf("\nDeployment Deleted: %s\n", deployment.Name)
-	}
 }
 
 // send-only channel as parameter
@@ -187,30 +178,30 @@ func getDeployment(store cache.Store, name string) {
 }
 
 func printDeployment(deployment *appsv1.Deployment) {
-	fmt.Printf("\tDeployment: %s\n", deployment.Name)
-	fmt.Printf("\tNamespace: %s\n", deployment.Namespace)
-	fmt.Printf("\tCreated: %s\n", deployment.CreationTimestamp.Format(time.RFC3339))
+	fmt.Printf("Deployment: %s\n", deployment.Name)
+	fmt.Printf("Namespace: %s\n", deployment.Namespace)
+	fmt.Printf("Created: %s\n", deployment.CreationTimestamp.Format(time.RFC3339))
 	if deployment.Spec.Replicas != nil {
-		fmt.Printf("\tReplicas: %d\n", *deployment.Spec.Replicas)
+		fmt.Printf("Replicas: %d\n", *deployment.Spec.Replicas)
 	}
 
 	if deployment.Annotations != nil {
-		fmt.Print("\tAnnotations:\n")
+		fmt.Print("Annotations:\n")
 		for k, v := range deployment.Annotations {
-			fmt.Printf("\t  %s: %s\n", k, v)
+			fmt.Printf("  %s: %s\n", k, v)
 		}
 	}
 
 	if deployment.Spec.Template.Spec.Containers != nil {
-		fmt.Print("\tContainers:\n")
+		fmt.Print("Containers:\n")
 		for _, container := range deployment.Spec.Template.Spec.Containers {
-			fmt.Printf("\t  - Name: %s\n", container.Name)
-			fmt.Printf("\t    Image: %s\n", container.Image)
+			fmt.Printf("  - Name: %s\n", container.Name)
+			fmt.Printf("    Image: %s\n", container.Image)
 		}
 	}
 
-	fmt.Print("\tStatus:\n")
-	fmt.Printf("\t  Available Replicas: %d\n", deployment.Status.AvailableReplicas)
-	fmt.Printf("\t  Ready Replicas: %d\n", deployment.Status.ReadyReplicas)
-	fmt.Printf("\t  Updated Replicas: %d\n", deployment.Status.UpdatedReplicas)
+	fmt.Print("Status:\n")
+	fmt.Printf("  Available Replicas: %d\n", deployment.Status.AvailableReplicas)
+	fmt.Printf("  Ready Replicas: %d\n", deployment.Status.ReadyReplicas)
+	fmt.Printf("  Updated Replicas: %d\n", deployment.Status.UpdatedReplicas)
 }
