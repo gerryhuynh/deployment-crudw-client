@@ -65,12 +65,18 @@ func main() {
 
 	// Create a channel with empty struct (0 bytes of memory)
 	// Only care about signalling, not sending data
-	stopCh := make(chan struct{})
+	stopCh := make(chan struct{}) // for controller
+	exitCh := make(chan struct{}) // for displayMenu
 
 	// Defer, so closes channel when main() ends/exits
 	defer close(stopCh)
+	// exitCh is already being used to send a signal in displayMenu
+	// so don't need to do defer close(exitCh)
+	// if do both, would end up trying to close an already closed channel:
+	// - displayMenu sends a signal to exitCh which will close the channel
+	// - defer close(exitCh) would then run and try to close an alr closed channel
 
-	// From Claude:
+	// Understanding from chatting with Claude (AI):
 	// But main() won't end until this ends
 	// This only ends when something externally triggers program termination
 	// E.g. SIGTERM signal or Ctrl+C (which sends SIGINT signal)
@@ -84,9 +90,13 @@ func main() {
 		return
 	}
 
-	// This blocks until something closes the channel
-	// This is a channel receiving without a variable to receive it
-	<-stopCh
+	go displayMenu(store, exitCh)
+
+	// blocking until exit signal is received from display menu
+	// unblocks, prints, main() returns, and close(stopCh) executes as well; program ends
+	// https://gobyexample.com/channel-synchronization
+	<-exitCh
+	fmt.Println("Exiting...")
 }
 
 func addFunc(obj interface{}) {
@@ -119,6 +129,61 @@ func deleteFunc(obj interface{}) {
 	if deployment, ok := obj.(*appsv1.Deployment); ok {
 		fmt.Printf("\nDeployment Deleted: %s\n", deployment.Name)
 	}
+}
+
+// send-only channel as parameter
+func displayMenu(store cache.Store, exitCh chan<- struct{}) {
+	for {
+		fmt.Println("\nOptions:")
+		fmt.Println("1. List Deployments")
+		fmt.Println("2. Read specific Deployment")
+		fmt.Println("3. Exit")
+		fmt.Print("> ")
+
+		var choice int
+		fmt.Scanln(&choice)
+
+		switch choice {
+		case 1:
+			listDeployments(store)
+		case 2:
+			fmt.Println("\nEnter deployment name: ")
+			fmt.Print("> ")
+			var name string
+			fmt.Scanln(&name)
+			getDeployment(store, name)
+		case 3:
+			// Send exit signal
+			exitCh <- struct{}{}
+			return
+		default:
+			fmt.Println("Invalid choice")
+		}
+	}
+}
+
+func listDeployments(store cache.Store) {
+	deployments := store.List()
+	fmt.Printf("\nFound %d deployments:\n", len(deployments))
+	for _, d := range deployments {
+		deployment := d.(*appsv1.Deployment)
+		fmt.Printf("- %s (Namespace: %s, Replicas: %d)\n", deployment.Name, deployment.Namespace, *deployment.Spec.Replicas)
+	}
+}
+
+func getDeployment(store cache.Store, name string) {
+	obj, exists, err := store.GetByKey(name)
+	if err != nil {
+		fmt.Printf("Error retrieving deployment: %v\n", err)
+		return
+	}
+	if !exists {
+		fmt.Printf("Deployment %s not found\n", name)
+		return
+	}
+	deployment := obj.(*appsv1.Deployment)
+	fmt.Println()
+	printDeployment(deployment)
 }
 
 func printDeployment(deployment *appsv1.Deployment) {
