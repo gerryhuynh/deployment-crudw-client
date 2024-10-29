@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -9,25 +8,20 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	v1 "k8s.io/client-go/kubernetes/typed/apps/v1"
-	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 var (
-	namespace      string
-	kubecontext    string
-	action         string
-	deploymentName string
+	namespace   string
+	kubecontext string
 )
 
 func main() {
-	pflag.StringVarP(&kubecontext, "context", "c", "", "the kubernetes context the deployment will be on")
+	pflag.StringVarP(&kubecontext, "context", "c", "apps-sandbox1-us-ce1-lg8", "the kubernetes context the deployment will be on")
 	pflag.StringVarP(&namespace, "namespace", "n", apiv1.NamespaceDefault, "the namespace the deployment will be on")
-	pflag.StringVarP(&action, "action", "a", "list", "CRUDW actions: create, get, list, update, delete, watch. Default: list")
-	pflag.StringVarP(&deploymentName, "deployment", "d", "demo-deployment", "the deployment name. Use for create, get, update, delete actions. Default: 'demo-deployment'")
 	pflag.Parse()
 
 	cfg, err := config.GetConfigWithContext(kubecontext)
@@ -42,195 +36,116 @@ func main() {
 		return
 	}
 
-	deploymentsClient := clientset.AppsV1().Deployments(namespace)
+	// Create deployment listwatcher
+	deploymentListWatcher := cache.NewListWatchFromClient(
+		clientset.AppsV1().RESTClient(),
+		"deployments",
+		namespace,
+		fields.Everything(),
+	)
 
-	switch action {
-	case "list":
-		if err := listDeployments(deploymentsClient, namespace); err != nil {
-			fmt.Println(err)
-		}
-	case "create":
-		if err := createDeployment(deploymentsClient, deploymentName); err != nil {
-			fmt.Println(err)
-		}
-	case "get":
-		if err := getDeployment(deploymentsClient, deploymentName); err != nil {
-			fmt.Println(err)
-		}
-	case "update":
-		if err := updateDeployment(deploymentsClient, deploymentName); err != nil {
-			fmt.Println(err)
-		}
-	case "delete":
-		if err := deleteDeployment(deploymentsClient, deploymentName); err != nil {
-			fmt.Println(err)
-		}
-	case "watch":
-		if err := watchDeployment(deploymentsClient); err != nil {
-			fmt.Println(err)
-		}
-	default:
-		fmt.Println("Invalid action")
+	informerOptions := cache.InformerOptions{
+		ListerWatcher: deploymentListWatcher,
+		ObjectType:    &appsv1.Deployment{},
+		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc:    addFunc,
+			UpdateFunc: updateFunc,
+			DeleteFunc: deleteFunc,
+		},
 	}
-}
 
-func listDeployments(deploymentsClient v1.DeploymentInterface, namespace string) error {
-	fmt.Printf("Listing deployments in namespace %q:\n", namespace)
-	list, err := deploymentsClient.List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list deployments: %v", err)
-	}
-	if len(list.Items) == 0 {
-		fmt.Println("No deployments found")
-		return nil
-	}
-	for _, d := range list.Items {
-		fmt.Printf(" * %s (%d replicas)\n", d.Name, *d.Spec.Replicas)
-	}
-	return nil
-}
+	store, controller := cache.NewInformerWithOptions(informerOptions)
 
-func createDeployment(deploymentsClient v1.DeploymentInterface, deploymentName string) error {
-	deployment := &appsv1.Deployment{
+	store.Add(&appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: deploymentName,
+			Name:      "demo-deployment",
+			Namespace: namespace,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: int32Ptr(2),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app": "demo",
-				},
-			},
-			Template: apiv1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app": "demo",
-					},
-				},
-				Spec: apiv1.PodSpec{
-					Containers: []apiv1.Container{
-						{
-							Name:  "web",
-							Image: "nginx:1.12",
-							Ports: []apiv1.ContainerPort{
-								{
-									Name:          "http",
-									Protocol:      apiv1.ProtocolTCP,
-									ContainerPort: 80,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	fmt.Println("Creating deployment...")
-	result, err := deploymentsClient.Create(context.TODO(), deployment, metav1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to create deployment: %v", err)
-	}
-	printDeployment(result)
-	return nil
-}
-
-func getDeployment(deploymentsClient v1.DeploymentInterface, deploymentName string) error {
-	fmt.Println("Getting deployment...")
-	result, getErr := deploymentsClient.Get(context.TODO(), deploymentName, metav1.GetOptions{})
-	if getErr != nil {
-		return fmt.Errorf("failed to get latest version of Deployment: %v", getErr)
-	}
-	printDeployment(result)
-	return nil
-}
-
-func updateDeployment(deploymentsClient v1.DeploymentInterface, deploymentName string) error {
-	fmt.Println("Updating deployment...")
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		result, getErr := deploymentsClient.Get(context.TODO(), deploymentName, metav1.GetOptions{})
-		if getErr != nil {
-			return fmt.Errorf("failed to get latest version of Deployment: %v", getErr)
-		}
-
-		result.Spec.Replicas = int32Ptr(1)
-		result.Spec.Template.Spec.Containers[0].Image = "nginx:1.13"
-		_, updateErr := deploymentsClient.Update(context.TODO(), result, metav1.UpdateOptions{})
-		return updateErr
 	})
-	if err != nil {
-		return fmt.Errorf("failed to update deployment: %v", err)
+
+	// Create a channel with empty struct (0 bytes of memory)
+	// Only care about signalling, not sending data
+	stopCh := make(chan struct{})
+
+	// Defer, so closes channel when main() ends/exits
+	defer close(stopCh)
+
+	// From Claude:
+	// But main() won't end until this ends
+	// This only ends when something externally triggers program termination
+	// E.g. SIGTERM signal or Ctrl+C (which sends SIGINT signal)
+	// Then the controller goes through graceful shutdown
+	// See this in the `select` blocks when clicking through
+	go controller.Run(stopCh)
+
+	// https://web.archive.org/web/20240317164624/https://docs.bitnami.com/tutorials/a-deep-dive-into-kubernetes-controllers
+	if !cache.WaitForCacheSync(stopCh, controller.HasSynced) {
+		fmt.Println("Timed out waiting for caches to sync")
+		return
 	}
-	return nil
+
+	// This blocks until something closes the channel
+	// This is a channel receiving without a variable to receive it
+	<-stopCh
 }
 
-func deleteDeployment(deploymentsClient v1.DeploymentInterface, deploymentName string) error {
-	fmt.Println("Deleting deployment...")
-	deletePolicy := metav1.DeletePropagationForeground
-	if err := deploymentsClient.Delete(context.TODO(), deploymentName, metav1.DeleteOptions{
-		PropagationPolicy: &deletePolicy,
-	}); err != nil {
-		return fmt.Errorf("failed to delete deployment: %v", err)
+func addFunc(obj interface{}) {
+	if deployment, ok := obj.(*appsv1.Deployment); ok {
+		fmt.Printf("\nNew Deployment Added: %s\n", deployment.Name)
 	}
-	fmt.Println("Deleted deployment.")
-	return nil
 }
 
-func watchDeployment(deploymentsClient v1.DeploymentInterface) error {
-	fmt.Println("Watching deployment client...")
-	watcher, err := deploymentsClient.Watch(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to watch deployment client: %v", err)
+func updateFunc(old, new interface{}) {
+	oldDeployment, ok := old.(*appsv1.Deployment)
+	if !ok {
+		return
 	}
-	for event := range watcher.ResultChan() {
-		if event.Type == watch.Deleted {
-			watcher.Stop()
-		}
-		fmt.Printf("Event Type: %s\n", event.Type)
+
+	newDeployment, ok := new.(*appsv1.Deployment)
+	if !ok {
+		return
 	}
-	return nil
+
+	fmt.Printf("\nDeployment Updated: %s -> %s\n", oldDeployment.Name, newDeployment.Name)
+
+	fmt.Println("\n\t[OLD]")
+	printDeployment(oldDeployment)
+
+	fmt.Println("\n\t[NEW]")
+	printDeployment(newDeployment)
+}
+
+func deleteFunc(obj interface{}) {
+	if deployment, ok := obj.(*appsv1.Deployment); ok {
+		fmt.Printf("\nDeployment Deleted: %s\n", deployment.Name)
+	}
 }
 
 func printDeployment(deployment *appsv1.Deployment) {
-	fmt.Printf("Deployment: %s\n", deployment.Name)
-	fmt.Printf("Namespace: %s\n", deployment.Namespace)
-	fmt.Printf("Created: %s\n", deployment.CreationTimestamp.Format(time.RFC3339))
-	fmt.Printf("Replicas: %d\n", *deployment.Spec.Replicas)
-
-	fmt.Print("Labels:\n")
-	for k, v := range deployment.Labels {
-		fmt.Printf("  %s: %s\n", k, v)
+	fmt.Printf("\tDeployment: %s\n", deployment.Name)
+	fmt.Printf("\tNamespace: %s\n", deployment.Namespace)
+	fmt.Printf("\tCreated: %s\n", deployment.CreationTimestamp.Format(time.RFC3339))
+	if deployment.Spec.Replicas != nil {
+		fmt.Printf("\tReplicas: %d\n", *deployment.Spec.Replicas)
 	}
 
-	fmt.Print("Annotations:\n")
-	for k, v := range deployment.Annotations {
-		fmt.Printf("  %s: %s\n", k, v)
-	}
-
-	fmt.Print("Containers:\n")
-	for _, container := range deployment.Spec.Template.Spec.Containers {
-		fmt.Printf("  - Name: %s\n", container.Name)
-		fmt.Printf("    Image: %s\n", container.Image)
-		fmt.Print("    Ports:\n")
-		for _, port := range container.Ports {
-			fmt.Printf("      - %s: %d\n", port.Name, port.ContainerPort)
+	if deployment.Annotations != nil {
+		fmt.Print("\tAnnotations:\n")
+		for k, v := range deployment.Annotations {
+			fmt.Printf("\t  %s: %s\n", k, v)
 		}
 	}
 
-	fmt.Print("Status:\n")
-	fmt.Printf("  Available Replicas: %d\n", deployment.Status.AvailableReplicas)
-	fmt.Printf("  Ready Replicas: %d\n", deployment.Status.ReadyReplicas)
-	fmt.Printf("  Updated Replicas: %d\n", deployment.Status.UpdatedReplicas)
-
-	fmt.Print("Conditions:\n")
-	for _, condition := range deployment.Status.Conditions {
-		fmt.Printf("  - Type: %s\n", condition.Type)
-		fmt.Printf("    Status: %s\n", condition.Status)
-		fmt.Printf("    Reason: %s\n", condition.Reason)
-		fmt.Printf("    Message: %s\n", condition.Message)
-		fmt.Printf("    Last Update: %s\n", condition.LastUpdateTime.Format(time.RFC3339))
+	if deployment.Spec.Template.Spec.Containers != nil {
+		fmt.Print("\tContainers:\n")
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			fmt.Printf("\t  - Name: %s\n", container.Name)
+			fmt.Printf("\t    Image: %s\n", container.Image)
+		}
 	}
-}
 
-func int32Ptr(i int32) *int32 { return &i }
+	fmt.Print("\tStatus:\n")
+	fmt.Printf("\t  Available Replicas: %d\n", deployment.Status.AvailableReplicas)
+	fmt.Printf("\t  Ready Replicas: %d\n", deployment.Status.ReadyReplicas)
+	fmt.Printf("\t  Updated Replicas: %d\n", deployment.Status.UpdatedReplicas)
+}
